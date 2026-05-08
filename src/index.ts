@@ -24,6 +24,7 @@ type EffectiveUserPlan = UserPlan & {
   trialActive: boolean;
   accessEndsAt: string | null;
   paymentRequired: boolean;
+  adminAccess: boolean;
 };
 
 type AuthenticatedRequest = Request & {
@@ -34,6 +35,11 @@ const FREE_TRIAL_DAYS = Number(process.env.FREE_TRIAL_DAYS ?? 7);
 const BILLING_PROVIDER = process.env.BILLING_PROVIDER ?? "wayforpay";
 const PAID_ACCESS_DAYS = Number(process.env.PAID_ACCESS_DAYS ?? 30);
 const LIQPAY_CHECKOUT_URL = "https://www.liqpay.ua/api/3/checkout";
+const ADMIN_EMAILS = new Set(
+  parseCsv(process.env.ADMIN_EMAILS)
+    .map((email) => email.toLowerCase())
+    .filter(Boolean),
+);
 
 const PLANS: Record<PlanId, UserPlan> = {
   free: {
@@ -240,7 +246,7 @@ app.post("/api/storage/check-capacity", requireAuth, async (req, res) => {
   const projectedBytes = usage.storageBytes + body.additionalBytes;
 
   res.json({
-    allowed: !plan.paymentRequired && projectedBytes <= plan.storageBytes,
+    allowed: plan.adminAccess || (!plan.paymentRequired && projectedBytes <= plan.storageBytes),
     plan,
     storageBytes: usage.storageBytes,
     projectedBytes,
@@ -267,7 +273,11 @@ app.post("/api/storage/sync", requireAuth, async (req, res) => {
   );
 
   const plan = await getCurrentPlan(user.uid);
-  res.json({ storageBytes, plan, allowed: !plan.paymentRequired && storageBytes <= plan.storageBytes });
+  res.json({
+    storageBytes,
+    plan,
+    allowed: plan.adminAccess || (!plan.paymentRequired && storageBytes <= plan.storageBytes),
+  });
 });
 
 app.post("/api/billing/checkout", requireAuth, async (req, res) => {
@@ -452,7 +462,7 @@ async function reserveAiRequest(userId: string) {
     const snapshot = await transaction.get(usageRef);
     const aiRequests = Number(snapshot.data()?.aiRequests ?? 0);
 
-    if (aiRequests >= plan.aiRequestsPerMonth) {
+    if (!plan.adminAccess && aiRequests >= plan.aiRequestsPerMonth) {
       throw httpError(402, "AI monthly limit reached. Upgrade the plan or wait for the next month.");
     }
 
@@ -472,8 +482,9 @@ async function reserveAiRequest(userId: string) {
 async function getCurrentPlan(userId: string): Promise<EffectiveUserPlan> {
   const snapshot = await ensureBillingUser(userId);
   const data = snapshot.data() ?? {};
+  const adminAccess = isAdminEmail(data.email);
   const planId = normalizePlan(data.planId) ?? "free";
-  const basePlan = PLANS[planId] ?? PLANS.free;
+  const basePlan = adminAccess ? PLANS.pro : PLANS[planId] ?? PLANS.free;
   const trialStartedAt = timestampToDate(data.trialStartedAt);
   const trialEndsAt = timestampToDate(data.trialEndsAt);
   const accessEndsAt = timestampToDate(data.accessEndsAt) ?? timestampToDate(data.currentPeriodEnd);
@@ -486,9 +497,10 @@ async function getCurrentPlan(userId: string): Promise<EffectiveUserPlan> {
     trialDays: FREE_TRIAL_DAYS,
     trialStartedAt: trialStartedAt ? trialStartedAt.toISOString() : null,
     trialEndsAt: trialEndsAt ? trialEndsAt.toISOString() : null,
-    trialActive: paidActive || trialActive,
+    trialActive: adminAccess || paidActive || trialActive,
     accessEndsAt: accessEndsAt ? accessEndsAt.toISOString() : null,
-    paymentRequired: !paidActive && !trialActive,
+    paymentRequired: !adminAccess && !paidActive && !trialActive,
+    adminAccess,
   };
 }
 
@@ -1004,6 +1016,10 @@ function parseCsv(value: string | undefined) {
     .split(",")
     .map((item) => item.trim())
     .filter(Boolean);
+}
+
+function isAdminEmail(email: unknown) {
+  return typeof email === "string" && ADMIN_EMAILS.has(email.trim().toLowerCase());
 }
 
 function httpError(status: number, message: string) {
