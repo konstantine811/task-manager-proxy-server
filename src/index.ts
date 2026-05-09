@@ -27,6 +27,18 @@ type EffectiveUserPlan = UserPlan & {
   adminAccess: boolean;
 };
 
+type AdminBillingUser = {
+  userId: string;
+  email: string | null;
+  plan: EffectiveUserPlan;
+  status: "admin" | "paid-active" | "trial-active" | "expired";
+  billingProvider: string | null;
+  subscriptionStatus: string | null;
+  wayforpayOrderReference: string | null;
+  updatedAt: string | null;
+  createdAt: string | null;
+};
+
 type AuthenticatedRequest = Request & {
   user: admin.auth.DecodedIdToken;
 };
@@ -141,6 +153,7 @@ app.get("/", (_req, res) => {
       advisorTasks: "/api/ai/advisor/tasks",
       checkout: "/api/billing/checkout",
       portal: "/api/billing/portal",
+      adminUsers: "/api/admin/users",
       adminTrial: "/api/admin/users/trial",
       wayforpayCallback: "/api/wayforpay/callback",
     },
@@ -168,6 +181,23 @@ app.get("/api/me", requireAuth, async (req, res) => {
     email: user.email ?? null,
     plan,
     usage,
+  });
+});
+
+app.get("/api/admin/users", requireAuth, requireAdmin, async (_req, res) => {
+  const snapshot = await db.collection("billingUsers").limit(500).get();
+  const users = snapshot.docs
+    .map((docSnap) => toAdminBillingUser(docSnap.id, docSnap.data()))
+    .sort((left, right) => {
+      const leftTime = left.updatedAt ? new Date(left.updatedAt).getTime() : 0;
+      const rightTime = right.updatedAt ? new Date(right.updatedAt).getTime() : 0;
+      return rightTime - leftTime;
+    });
+
+  res.json({
+    users,
+    total: users.length,
+    activePaid: users.filter((user) => user.status === "paid-active").length,
   });
 });
 
@@ -520,7 +550,10 @@ async function getCurrentPlan(
   email?: string | null,
 ): Promise<EffectiveUserPlan> {
   const snapshot = await ensureBillingUser(userId, email ?? undefined);
-  const data = snapshot.data() ?? {};
+  return buildEffectivePlan(snapshot.data() ?? {});
+}
+
+function buildEffectivePlan(data: FirebaseFirestore.DocumentData): EffectiveUserPlan {
   const adminAccess = isAdminEmail(data.email);
   const planId = normalizePlan(data.planId) ?? "free";
   const basePlan = adminAccess ? PLANS.pro : PLANS[planId] ?? PLANS.free;
@@ -540,6 +573,37 @@ async function getCurrentPlan(
     accessEndsAt: accessEndsAt ? accessEndsAt.toISOString() : null,
     paymentRequired: !adminAccess && !paidActive && !trialActive,
     adminAccess,
+  };
+}
+
+function toAdminBillingUser(
+  userId: string,
+  data: FirebaseFirestore.DocumentData,
+): AdminBillingUser {
+  const plan = buildEffectivePlan(data);
+  const status: AdminBillingUser["status"] = plan.adminAccess
+    ? "admin"
+    : plan.id !== "free" && !plan.paymentRequired
+      ? "paid-active"
+      : plan.trialActive
+        ? "trial-active"
+        : "expired";
+
+  return {
+    userId,
+    email: typeof data.email === "string" ? data.email : null,
+    plan,
+    status,
+    billingProvider:
+      typeof data.billingProvider === "string" ? data.billingProvider : null,
+    subscriptionStatus:
+      typeof data.subscriptionStatus === "string" ? data.subscriptionStatus : null,
+    wayforpayOrderReference:
+      typeof data.wayforpayOrderReference === "string"
+        ? data.wayforpayOrderReference
+        : null,
+    updatedAt: timestampToDate(data.updatedAt)?.toISOString() ?? null,
+    createdAt: timestampToDate(data.createdAt)?.toISOString() ?? null,
   };
 }
 
