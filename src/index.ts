@@ -36,7 +36,11 @@ const BILLING_PROVIDER = process.env.BILLING_PROVIDER ?? "wayforpay";
 const PAID_ACCESS_DAYS = Number(process.env.PAID_ACCESS_DAYS ?? 30);
 const LIQPAY_CHECKOUT_URL = "https://www.liqpay.ua/api/3/checkout";
 const ADMIN_EMAILS = new Set(
-  parseCsv(process.env.ADMIN_EMAILS)
+  [
+    ...parseCsv(process.env.ADMIN_EMAILS),
+    "constainabrams@gmail.com",
+    "constainabrams@gmial.com",
+  ]
     .map((email) => email.toLowerCase())
     .filter(Boolean),
 );
@@ -159,6 +163,7 @@ app.get("/", (_req, res) => {
       advisorTasks: "/api/ai/advisor/tasks",
       checkout: "/api/billing/checkout",
       portal: "/api/billing/portal",
+      adminTrial: "/api/admin/users/trial",
       liqpayCallback: "/api/liqpay/callback",
       wayforpayCallback: "/api/wayforpay/callback",
     },
@@ -176,7 +181,10 @@ app.get("/health", (_req, res) => {
 app.get("/api/me", requireAuth, async (req, res) => {
   const user = authUser(req);
   const userId = user.uid;
-  const [plan, usage] = await Promise.all([getCurrentPlan(userId), getMonthlyUsage(userId)]);
+  const [plan, usage] = await Promise.all([
+    getCurrentPlan(userId, user.email),
+    getMonthlyUsage(userId),
+  ]);
 
   res.json({
     userId,
@@ -184,6 +192,58 @@ app.get("/api/me", requireAuth, async (req, res) => {
     plan,
     usage,
   });
+});
+
+app.post("/api/admin/users/trial", requireAuth, requireAdmin, async (req, res) => {
+  const body = z
+    .object({
+      email: z.string().email().optional(),
+      userId: z.string().min(1).optional(),
+      trialEndsAt: z.string().datetime().optional(),
+      trialDaysFromNow: z.number().finite().optional(),
+      expired: z.boolean().optional(),
+    })
+    .refine((value) => value.email || value.userId, {
+      message: "Provide either email or userId.",
+      path: ["email"],
+    })
+    .refine(
+      (value) =>
+        [value.trialEndsAt, value.trialDaysFromNow, value.expired ? true : undefined].filter(
+          (item) => item !== undefined,
+        ).length === 1,
+      {
+        message: "Provide exactly one of trialEndsAt, trialDaysFromNow, or expired.",
+        path: ["trialEndsAt"],
+      },
+    )
+    .parse(req.body);
+
+  const userId = body.userId ?? (await getUserIdByEmail(body.email!));
+  const now = new Date();
+  const trialEndsAt = body.expired
+    ? new Date(now.getTime() - 60 * 1000)
+    : body.trialEndsAt
+      ? new Date(body.trialEndsAt)
+      : new Date(now.getTime() + Number(body.trialDaysFromNow) * 24 * 60 * 60 * 1000);
+
+  const update: FirebaseFirestore.UpdateData<FirebaseFirestore.DocumentData> = {
+    planId: "free",
+    trialStartedAt: Timestamp.fromDate(now),
+    trialEndsAt: Timestamp.fromDate(trialEndsAt),
+    accessEndsAt: FieldValue.delete(),
+    currentPeriodEnd: FieldValue.delete(),
+    subscriptionStatus: "admin_test_override",
+    updatedAt: FieldValue.serverTimestamp(),
+  };
+  if (body.email) {
+    update.email = body.email.trim().toLowerCase();
+  }
+
+  await getUserDoc(userId).set(update, { merge: true });
+
+  const [plan, usage] = await Promise.all([getCurrentPlan(userId), getMonthlyUsage(userId)]);
+  res.json({ userId, email: body.email ?? null, plan, usage });
 });
 
 app.post("/api/ai/parse-tasks", requireAuth, async (req, res) => {
@@ -413,6 +473,18 @@ function authUser(req: Request) {
   return user;
 }
 
+async function requireAdmin(req: Request, _res: Response, next: NextFunction) {
+  try {
+    const user = authUser(req);
+    if (!isAdminEmail(user.email)) {
+      throw httpError(403, "Admin access is required.");
+    }
+    next();
+  } catch (error) {
+    next(error);
+  }
+}
+
 async function generateJson(
   userId: string,
   input: { contents: string; temperature: number; maxOutputTokens: number },
@@ -479,8 +551,11 @@ async function reserveAiRequest(userId: string) {
   });
 }
 
-async function getCurrentPlan(userId: string): Promise<EffectiveUserPlan> {
-  const snapshot = await ensureBillingUser(userId);
+async function getCurrentPlan(
+  userId: string,
+  email?: string | null,
+): Promise<EffectiveUserPlan> {
+  const snapshot = await ensureBillingUser(userId, email ?? undefined);
   const data = snapshot.data() ?? {};
   const adminAccess = isAdminEmail(data.email);
   const planId = normalizePlan(data.planId) ?? "free";
@@ -552,6 +627,8 @@ async function ensureBillingUser(userId: string, email?: string) {
   const snapshot = await ref.get();
   const now = new Date();
   const data = snapshot.data();
+  const nextEmail = email ?? data?.email ?? null;
+  const adminAccess = isAdminEmail(nextEmail);
   const trialStartedAt = timestampToDate(data?.trialStartedAt) ?? now;
   const trialEndsAt =
     timestampToDate(data?.trialEndsAt) ??
@@ -561,7 +638,8 @@ async function ensureBillingUser(userId: string, email?: string) {
     await ref.set(
       {
         planId: normalizePlan(data?.planId) ?? "free",
-        email: email ?? data?.email ?? null,
+        email: nextEmail,
+        adminAccess,
         trialStartedAt: Timestamp.fromDate(trialStartedAt),
         trialEndsAt: Timestamp.fromDate(trialEndsAt),
         createdAt: data?.createdAt ?? FieldValue.serverTimestamp(),
@@ -573,10 +651,11 @@ async function ensureBillingUser(userId: string, email?: string) {
     return ref.get();
   }
 
-  if (email && data.email !== email) {
+  if ((email && data.email !== email) || data.adminAccess !== adminAccess) {
     await ref.set(
       {
-        email,
+        email: nextEmail,
+        adminAccess,
         updatedAt: FieldValue.serverTimestamp(),
       },
       { merge: true },
@@ -924,6 +1003,15 @@ async function findBillingUserByEmail(email: string) {
     .limit(1)
     .get();
   return snapshot.docs[0] ?? null;
+}
+
+async function getUserIdByEmail(email: string) {
+  try {
+    const user = await admin.auth().getUserByEmail(email.trim().toLowerCase());
+    return user.uid;
+  } catch {
+    throw httpError(404, `Firebase user was not found for email: ${email}`);
+  }
 }
 
 function timestampToDate(value: unknown): Date | null {
