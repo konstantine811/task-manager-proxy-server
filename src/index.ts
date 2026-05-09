@@ -7,7 +7,7 @@ import { GoogleGenAI } from "@google/genai";
 import { z } from "zod";
 import admin from "firebase-admin";
 import { FieldValue, Timestamp } from "firebase-admin/firestore";
-import { createHash, createHmac, timingSafeEqual } from "node:crypto";
+import { createHmac, timingSafeEqual } from "node:crypto";
 
 type PlanId = "free" | "starter" | "pro";
 
@@ -34,13 +34,8 @@ type AuthenticatedRequest = Request & {
 const FREE_TRIAL_DAYS = Number(process.env.FREE_TRIAL_DAYS ?? 7);
 const BILLING_PROVIDER = process.env.BILLING_PROVIDER ?? "wayforpay";
 const PAID_ACCESS_DAYS = Number(process.env.PAID_ACCESS_DAYS ?? 30);
-const LIQPAY_CHECKOUT_URL = "https://www.liqpay.ua/api/3/checkout";
 const ADMIN_EMAILS = new Set(
-  [
-    ...parseCsv(process.env.ADMIN_EMAILS),
-    "constainabrams@gmail.com",
-    "constainabrams@gmial.com",
-  ]
+  parseCsv(process.env.ADMIN_EMAILS)
     .map((email) => email.toLowerCase())
     .filter(Boolean),
 );
@@ -73,12 +68,7 @@ const PLAN_BY_PRICE_ID = new Map<string, PlanId>(
 const app = express();
 const port = Number(process.env.PORT ?? 8787);
 const appUrl = process.env.APP_URL ?? "http://localhost:5173";
-const publicProxyUrl = process.env.PUBLIC_PROXY_URL ?? "";
 const geminiModel = process.env.GEMINI_MODEL ?? "gemini-2.5-flash";
-const liqpayPublicKey = process.env.LIQPAY_PUBLIC_KEY;
-const liqpayPrivateKey = process.env.LIQPAY_PRIVATE_KEY;
-const liqpayCurrency = process.env.LIQPAY_CURRENCY ?? "USD";
-const liqpaySignatureAlgorithm = process.env.LIQPAY_SIGNATURE_ALGORITHM ?? "sha3-256";
 const wayforpayMerchantAccount = process.env.WAYFORPAY_MERCHANT_ACCOUNT;
 const wayforpaySecretKey = process.env.WAYFORPAY_SECRET_KEY;
 const wayforpayCurrency = process.env.WAYFORPAY_CURRENCY ?? "UAH";
@@ -106,18 +96,6 @@ app.post(
   async (req, res, next) => {
     try {
       await handleStripeWebhook(req, res);
-    } catch (error) {
-      next(error);
-    }
-  },
-);
-
-app.post(
-  "/api/liqpay/callback",
-  express.urlencoded({ extended: false }),
-  async (req, res, next) => {
-    try {
-      await handleLiqPayCallback(req, res);
     } catch (error) {
       next(error);
     }
@@ -164,7 +142,6 @@ app.get("/", (_req, res) => {
       checkout: "/api/billing/checkout",
       portal: "/api/billing/portal",
       adminTrial: "/api/admin/users/trial",
-      liqpayCallback: "/api/liqpay/callback",
       wayforpayCallback: "/api/wayforpay/callback",
     },
   });
@@ -353,12 +330,6 @@ app.post("/api/billing/checkout", requireAuth, async (req, res) => {
     return;
   }
 
-  if (BILLING_PROVIDER === "liqpay") {
-    const checkout = await createLiqPayCheckout(user, body.plan);
-    res.json(checkout);
-    return;
-  }
-
   ensureStripe();
   const priceId =
     body.plan === "starter"
@@ -396,13 +367,6 @@ app.post("/api/billing/portal", requireAuth, async (req, res) => {
   if (BILLING_PROVIDER === "wayforpay") {
     res.status(501).json({
       error: "WayForPay hosted subscriptions are managed on the WayForPay subscription page.",
-    });
-    return;
-  }
-
-  if (BILLING_PROVIDER === "liqpay") {
-    res.status(501).json({
-      error: "LiqPay billing portal is not available. Show plan renewal controls in the app.",
     });
     return;
   }
@@ -665,105 +629,6 @@ async function ensureBillingUser(userId: string, email?: string) {
   return snapshot;
 }
 
-async function createLiqPayCheckout(user: admin.auth.DecodedIdToken, plan: "starter" | "pro") {
-  ensureLiqPay();
-  if (!publicProxyUrl) {
-    throw httpError(500, "PUBLIC_PROXY_URL is required for LiqPay callbacks.");
-  }
-  await ensureBillingUser(user.uid, user.email);
-
-  const amount = plan === "starter" ? liqpayAmount("STARTER", 3) : liqpayAmount("PRO", 5);
-  const orderId = `${user.uid}_${plan}_${Date.now()}`;
-  const description = `Task Manager ${plan} plan - ${PAID_ACCESS_DAYS} days`;
-  const payload = {
-    public_key: liqpayPublicKey,
-    version: 7,
-    action: "pay",
-    amount,
-    currency: liqpayCurrency,
-    description,
-    order_id: orderId,
-    result_url: `${appUrl}/app/billing?checkout=success`,
-    server_url: `${publicProxyUrl}/api/liqpay/callback`,
-    info: JSON.stringify({ userId: user.uid, plan }),
-  };
-  const data = encodeLiqPayData(payload);
-  const signature = signLiqPayData(data);
-
-  await db.collection("billingOrders").doc(orderId).set({
-    userId: user.uid,
-    plan,
-    provider: "liqpay",
-    amount,
-    currency: liqpayCurrency,
-    status: "created",
-    data,
-    createdAt: FieldValue.serverTimestamp(),
-    updatedAt: FieldValue.serverTimestamp(),
-  });
-
-  return {
-    provider: "liqpay",
-    checkoutUrl: LIQPAY_CHECKOUT_URL,
-    method: "POST",
-    data,
-    signature,
-    orderId,
-  };
-}
-
-async function handleLiqPayCallback(req: Request, res: Response) {
-  ensureLiqPay();
-  const body = z.object({ data: z.string(), signature: z.string() }).parse(req.body);
-  const expectedSignature = signLiqPayData(body.data);
-
-  if (!safeEqual(body.signature, expectedSignature)) {
-    throw httpError(400, "Invalid LiqPay callback signature.");
-  }
-
-  const payload = decodeLiqPayData(body.data);
-  const orderId = String(payload.order_id ?? "");
-  const status = String(payload.status ?? "");
-  const orderRef = db.collection("billingOrders").doc(orderId);
-  const orderSnapshot = await orderRef.get();
-  const order = orderSnapshot.data();
-  const plan = normalizePlan(order?.plan) ?? normalizePlanFromLiqPayInfo(payload.info);
-  const userId = String(order?.userId ?? payload.userId ?? "");
-
-  await orderRef.set(
-    {
-      liqpayPayload: payload,
-      status,
-      updatedAt: FieldValue.serverTimestamp(),
-    },
-    { merge: true },
-  );
-
-  if (userId && (status === "success" || status === "subscribed") && (plan === "starter" || plan === "pro")) {
-    const now = Date.now();
-    const currentPlan = await getCurrentPlan(userId);
-    const baseAccessEndsAt =
-      currentPlan.accessEndsAt && new Date(currentPlan.accessEndsAt).getTime() > now
-        ? new Date(currentPlan.accessEndsAt).getTime()
-        : now;
-    const accessEndsAt = new Date(baseAccessEndsAt + PAID_ACCESS_DAYS * 24 * 60 * 60 * 1000);
-
-    await setUserSubscription(userId, {
-      planId: plan,
-      stripeCustomerId: "",
-      stripeSubscriptionId: "",
-      subscriptionStatus: "active",
-      currentPeriodEnd: Timestamp.fromDate(accessEndsAt),
-      accessEndsAt: Timestamp.fromDate(accessEndsAt),
-      billingProvider: "liqpay",
-      liqpayOrderId: orderId,
-      liqpayPaymentId: payload.payment_id ? String(payload.payment_id) : null,
-    });
-  }
-
-  res.json({ ok: true });
-}
-
 async function handleWayForPayCallback(req: Request, res: Response) {
   ensureWayForPay();
   const payload = z
@@ -935,8 +800,6 @@ async function setUserSubscription(
     currentPeriodEnd?: Timestamp | null;
     accessEndsAt?: Timestamp | null;
     billingProvider?: string;
-    liqpayOrderId?: string;
-    liqpayPaymentId?: string | null;
     wayforpayOrderReference?: string;
   },
 ) {
@@ -967,16 +830,6 @@ function normalizePlan(value: unknown): PlanId | null {
 
 function normalizePlanByPrice(priceId: string | undefined): PlanId | null {
   return priceId ? PLAN_BY_PRICE_ID.get(priceId) ?? null : null;
-}
-
-function normalizePlanFromLiqPayInfo(info: unknown): PlanId | null {
-  if (typeof info !== "string") return null;
-  try {
-    const parsed = JSON.parse(info) as { plan?: unknown };
-    return normalizePlan(parsed.plan);
-  } catch {
-    return null;
-  }
 }
 
 function resolveWayForPayPlan(
@@ -1028,12 +881,6 @@ function ensureStripe() {
   if (!stripe) throw httpError(500, "STRIPE_SECRET_KEY is not configured.");
 }
 
-function ensureLiqPay() {
-  if (!liqpayPublicKey || !liqpayPrivateKey) {
-    throw httpError(500, "LIQPAY_PUBLIC_KEY and LIQPAY_PRIVATE_KEY are not configured.");
-  }
-}
-
 function ensureWayForPay() {
   if (!wayforpaySecretKey) {
     throw httpError(500, "WAYFORPAY_SECRET_KEY is not configured.");
@@ -1042,23 +889,6 @@ function ensureWayForPay() {
 
 function ensureGemini() {
   if (!genai) throw httpError(500, "GEMINI_API_KEY is not configured.");
-}
-
-function liqpayAmount(planKey: "STARTER" | "PRO", fallback: number) {
-  return Number(process.env[`LIQPAY_${planKey}_AMOUNT`] ?? fallback);
-}
-
-function encodeLiqPayData(payload: Record<string, unknown>) {
-  return Buffer.from(JSON.stringify(payload)).toString("base64");
-}
-
-function decodeLiqPayData(data: string) {
-  return JSON.parse(Buffer.from(data, "base64").toString("utf8")) as Record<string, unknown>;
-}
-
-function signLiqPayData(data: string) {
-  const signString = `${liqpayPrivateKey}${data}${liqpayPrivateKey}`;
-  return createHash(liqpaySignatureAlgorithm).update(signString).digest("base64");
 }
 
 function signWayForPayServicePayload(payload: {

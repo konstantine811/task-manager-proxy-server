@@ -42,7 +42,6 @@ vercel env add WAYFORPAY_SECRET_KEY production
 vercel env add WAYFORPAY_CURRENCY production
 vercel env add WAYFORPAY_STARTER_AMOUNT production
 vercel env add WAYFORPAY_PRO_AMOUNT production
-vercel env add PUBLIC_PROXY_URL production
 vercel env add APP_URL production
 vercel env add CORS_ORIGINS production
 vercel env add FREE_TRIAL_DAYS production
@@ -67,7 +66,6 @@ Required environment variables:
 - `WAYFORPAY_STARTER_AMOUNT`
 - `WAYFORPAY_PRO_AMOUNT`
 - `FIREBASE_STORAGE_BUCKET`
-- `PUBLIC_PROXY_URL`
 - `APP_URL`
 - `CORS_ORIGINS`
 - `FREE_TRIAL_DAYS` defaults to `7`
@@ -145,10 +143,6 @@ WAYFORPAY_CURRENCY=UAH
 WAYFORPAY_STARTER_AMOUNT=120
 WAYFORPAY_PRO_AMOUNT=200
 ```
-
-## LiqPay fallback
-
-LiqPay support still exists in the code. Set `BILLING_PROVIDER=liqpay` and configure the `LIQPAY_*` env variables if you want to use it instead.
 
 ## Storage
 
