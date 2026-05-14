@@ -2,26 +2,23 @@
 
 Node.js proxy server for the public Task Manager app.
 
-It keeps AI keys on the server, verifies Firebase users, applies monthly AI and storage limits, and updates paid plans through WayForPay callbacks.
+It keeps AI keys on the server, verifies Firebase users, applies monthly AI and storage limits, and grants paid access through Portmone payments.
 
 ## Plans
 
 | Plan | Price | AI requests / month | Storage |
 | --- | ---: | ---: | ---: |
 | `free` | 7-day trial | 30 | 100 MB |
-| `starter` | $3 / month | 250 | 1 GB |
-| `pro` | $5 / month | 800 | 5 GB |
+| `starter` | configured in `PORTMONE_STARTER_AMOUNT` | 250 | 1 GB |
+| `pro` | configured in `PORTMONE_PRO_AMOUNT` | 800 | 5 GB |
 
 The `free` plan is a trial, not a forever-free AI plan. After `FREE_TRIAL_DAYS`, AI requests return `402 Payment Required`, and `/api/me` returns `plan.paymentRequired: true`.
 
-WayForPay subscription payments grant `PAID_ACCESS_DAYS` days of access on every successful callback. This works with the hosted WayForPay subscription page.
-
-You can change limits in `src/index.ts` in the `PLANS` object, the trial length through `FREE_TRIAL_DAYS`, and the paid access period through `PAID_ACCESS_DAYS`.
+Every verified Portmone payment grants `PAID_ACCESS_DAYS` days of access. If the user already has active access, the new period is added to the current access end date.
 
 ## Setup
 
 ```bash
-cd ai-proxy-server
 npm install
 cp .env.example .env
 npm run dev
@@ -36,42 +33,42 @@ vercel
 vercel env add GEMINI_API_KEY production
 vercel env add FIREBASE_SERVICE_ACCOUNT_JSON production
 vercel env add FIREBASE_STORAGE_BUCKET production
-vercel env add WAYFORPAY_SUBSCRIPTION_URL production
-vercel env add WAYFORPAY_MERCHANT_ACCOUNT production
-vercel env add WAYFORPAY_SECRET_KEY production
-vercel env add WAYFORPAY_CURRENCY production
-vercel env add WAYFORPAY_STARTER_AMOUNT production
-vercel env add WAYFORPAY_PRO_AMOUNT production
+vercel env add PORTMONE_PAYEE_ID production
+vercel env add PORTMONE_LOGIN production
+vercel env add PORTMONE_PASSWORD production
+vercel env add PORTMONE_SIGNATURE_KEY production
+vercel env add PORTMONE_STARTER_AMOUNT production
+vercel env add PORTMONE_PRO_AMOUNT production
 vercel env add APP_URL production
+vercel env add PROXY_URL production
 vercel env add CORS_ORIGINS production
 vercel env add FREE_TRIAL_DAYS production
 vercel env add PAID_ACCESS_DAYS production
-vercel env add BILLING_PROVIDER production
 vercel --prod
-```
-
-After deploy, set the frontend env to the proxy URL:
-
-```bash
-VITE_AI_PROXY_URL=https://your-proxy-project.vercel.app
 ```
 
 Required environment variables:
 
 - `GEMINI_API_KEY`
-- `WAYFORPAY_SUBSCRIPTION_URL`
-- `WAYFORPAY_MERCHANT_ACCOUNT`
-- `WAYFORPAY_SECRET_KEY`
-- `WAYFORPAY_CURRENCY`
-- `WAYFORPAY_STARTER_AMOUNT`
-- `WAYFORPAY_PRO_AMOUNT`
+- `PORTMONE_PAYEE_ID`
+- `PORTMONE_LOGIN`
+- `PORTMONE_PASSWORD`
+- `PORTMONE_SIGNATURE_KEY`
+- `PORTMONE_STARTER_AMOUNT`
+- `PORTMONE_PRO_AMOUNT`
 - `FIREBASE_STORAGE_BUCKET`
 - `APP_URL`
+- `PROXY_URL`
 - `CORS_ORIGINS`
 - `FREE_TRIAL_DAYS` defaults to `7`
 - `PAID_ACCESS_DAYS` defaults to `30`
-- `BILLING_PROVIDER` defaults to `wayforpay`
 - either `GOOGLE_APPLICATION_CREDENTIALS` or `FIREBASE_SERVICE_ACCOUNT_JSON`
+
+Optional Portmone variables:
+
+- `PORTMONE_GATEWAY_URL` defaults to `https://www.portmone.com.ua/gateway/`
+- `PORTMONE_CURRENCY` defaults to `UAH`
+- `PORTMONE_LANGUAGE` defaults to `uk`
 
 For Vercel, `FIREBASE_SERVICE_ACCOUNT_JSON` is usually simpler than `GOOGLE_APPLICATION_CREDENTIALS`. Paste the full Firebase service account JSON as one environment variable.
 
@@ -102,46 +99,51 @@ const response = await fetch(`${import.meta.env.VITE_AI_PROXY_URL}/api/ai/parse-
 - `POST /api/storage/check-capacity`
 - `POST /api/storage/sync`
 - `POST /api/billing/checkout`
-- `POST /api/billing/portal`
-- `POST /api/wayforpay/callback`
+- `GET /api/portmone/checkout/:orderReference`
+- `POST /api/portmone/callback`
+- `POST /api/portmone/sync`
 
-## WayForPay
+## Portmone
 
-Use the hosted subscription page:
+`POST /api/billing/checkout` accepts:
+
+```json
+{ "plan": "starter" }
+```
+
+It creates a `billingOrders/{orderReference}` record and returns:
+
+```json
+{
+  "provider": "portmone",
+  "orderReference": "lf-starter-...",
+  "checkoutUrl": "https://your-proxy-domain.com/api/portmone/checkout/lf-starter-..."
+}
+```
+
+Open `checkoutUrl` in the browser. The proxy renders a small auto-submit form because Portmone's payment gateway expects a browser POST with `bodyRequest` and `typeRequest=json`.
+
+Set the Portmone success URL to:
 
 ```txt
-https://secure.wayforpay.com/sub/s1a4266d903dc
+https://your-proxy-domain.com/api/portmone/callback
 ```
 
-Set this as the frontend env:
-
-```bash
-VITE_WAYFORPAY_SUBSCRIPTION_URL=https://secure.wayforpay.com/sub/s1a4266d903dc
-```
-
-In the WayForPay subscription page settings, set Service URL:
+The callback does not trust the browser payload by itself. It calls Portmone's `result` API with `PORTMONE_LOGIN`, `PORTMONE_PASSWORD`, `PORTMONE_PAYEE_ID`, checks that status is `PAYED`, validates the amount, and then updates `billingUsers/{uid}` with:
 
 ```txt
-https://your-proxy-domain.com/api/wayforpay/callback
+billingProvider=portmone
+subscriptionStatus=active
+portmoneOrderReference={orderReference}
+accessEndsAt={now + PAID_ACCESS_DAYS}
 ```
-
-The callback verifies WayForPay `merchantSignature` with `WAYFORPAY_SECRET_KEY` using HMAC-MD5, then matches the payer email to `billingUsers.email`.
-
-Important: make email required on the WayForPay subscription page and tell users to enter the same email as their Life Focus login.
-
-By default, plan mapping is:
-
-- product name contains `Starter` -> `starter`
-- product name contains `Pro` -> `pro`
-- otherwise amount >= `WAYFORPAY_PRO_AMOUNT` -> `pro`
-- otherwise amount >= `WAYFORPAY_STARTER_AMOUNT` -> `starter`
 
 Recommended UAH pricing:
 
 ```bash
-WAYFORPAY_CURRENCY=UAH
-WAYFORPAY_STARTER_AMOUNT=120
-WAYFORPAY_PRO_AMOUNT=200
+PORTMONE_CURRENCY=UAH
+PORTMONE_STARTER_AMOUNT=120
+PORTMONE_PRO_AMOUNT=200
 ```
 
 ## Storage

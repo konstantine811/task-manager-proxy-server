@@ -2,129 +2,36 @@ import "dotenv/config";
 import cors from "cors";
 import express, { type NextFunction, type Request, type Response } from "express";
 import helmet from "helmet";
-import Stripe from "stripe";
-import { GoogleGenAI } from "@google/genai";
-import { z } from "zod";
-import admin from "firebase-admin";
 import { FieldValue, Timestamp } from "firebase-admin/firestore";
-import { createHmac, timingSafeEqual } from "node:crypto";
-
-type PlanId = "free" | "starter" | "pro";
-
-type UserPlan = {
-  id: PlanId;
-  aiRequestsPerMonth: number;
-  storageBytes: number;
-};
-
-type EffectiveUserPlan = UserPlan & {
-  trialDays: number;
-  trialStartedAt: string | null;
-  trialEndsAt: string | null;
-  trialActive: boolean;
-  accessEndsAt: string | null;
-  paymentRequired: boolean;
-  adminAccess: boolean;
-};
-
-type AdminBillingUser = {
-  userId: string;
-  email: string | null;
-  plan: EffectiveUserPlan;
-  status: "admin" | "paid-active" | "trial-active" | "expired";
-  billingProvider: string | null;
-  subscriptionStatus: string | null;
-  wayforpayOrderReference: string | null;
-  updatedAt: string | null;
-  createdAt: string | null;
-};
-
-type AuthenticatedRequest = Request & {
-  user: admin.auth.DecodedIdToken;
-};
-
-const FREE_TRIAL_DAYS = Number(process.env.FREE_TRIAL_DAYS ?? 7);
-const BILLING_PROVIDER = process.env.BILLING_PROVIDER ?? "wayforpay";
-const PAID_ACCESS_DAYS = Number(process.env.PAID_ACCESS_DAYS ?? 30);
-const ADMIN_EMAILS = new Set(
-  parseCsv(process.env.ADMIN_EMAILS)
-    .map((email) => email.toLowerCase())
-    .filter(Boolean),
-);
-
-const PLANS: Record<PlanId, UserPlan> = {
-  free: {
-    id: "free",
-    aiRequestsPerMonth: 30,
-    storageBytes: 100 * 1024 * 1024,
-  },
-  starter: {
-    id: "starter",
-    aiRequestsPerMonth: 250,
-    storageBytes: 1024 * 1024 * 1024,
-  },
-  pro: {
-    id: "pro",
-    aiRequestsPerMonth: 800,
-    storageBytes: 5 * 1024 * 1024 * 1024,
-  },
-};
-
-const PLAN_BY_PRICE_ID = new Map<string, PlanId>(
-  [
-    [process.env.STRIPE_PRICE_STARTER_MONTHLY, "starter"],
-    [process.env.STRIPE_PRICE_PRO_MONTHLY, "pro"],
-  ].filter((entry): entry is [string, PlanId] => Boolean(entry[0])),
-);
+import { z } from "zod";
+import { FIREBASE_STORAGE_BUCKET, FREE_TRIAL_DAYS, PLANS, PORT, parseCsv } from "./config.js";
+import { admin, db } from "./firebase.js";
+import { authUser, requireAdmin, requireAuth } from "./auth.js";
+import { httpError } from "./errors.js";
+import {
+  ADVISOR_ADVICE_ONLY_SYSTEM,
+  ADVISOR_TASKS_ONLY_SYSTEM,
+  PARSE_TASKS_SYSTEM,
+  generateJson,
+} from "./ai.js";
+import {
+  getCurrentPlan,
+  getMonthlyUsage,
+  getUserDoc,
+  getUserIdByEmail,
+  toAdminBillingUser,
+} from "./billing/users.js";
+import {
+  createPortmoneCheckout,
+  handlePortmoneCallback,
+  renderPortmoneCheckout,
+  syncPortmoneOrder,
+} from "./billing/portmone.js";
 
 const app = express();
-const port = Number(process.env.PORT ?? 8787);
-const appUrl = process.env.APP_URL ?? "http://localhost:5173";
-const geminiModel = process.env.GEMINI_MODEL ?? "gemini-2.5-flash";
-const wayforpayMerchantAccount = process.env.WAYFORPAY_MERCHANT_ACCOUNT;
-const wayforpaySecretKey = process.env.WAYFORPAY_SECRET_KEY;
-const wayforpayCurrency = process.env.WAYFORPAY_CURRENCY ?? "UAH";
-
-initializeFirebase();
-
-const db = admin.firestore();
-const bucketName = process.env.FIREBASE_STORAGE_BUCKET;
-const stripe = process.env.STRIPE_SECRET_KEY
-  ? new Stripe(process.env.STRIPE_SECRET_KEY, {
-      apiVersion: "2026-02-25.clover",
-      typescript: true,
-    })
-  : null;
-const genai = process.env.GEMINI_API_KEY
-  ? new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY })
-  : null;
 
 app.disable("x-powered-by");
 app.use(helmet());
-
-app.post(
-  "/api/stripe/webhook",
-  express.raw({ type: "application/json" }),
-  async (req, res, next) => {
-    try {
-      await handleStripeWebhook(req, res);
-    } catch (error) {
-      next(error);
-    }
-  },
-);
-
-app.post(
-  "/api/wayforpay/callback",
-  express.json({ limit: "1mb" }),
-  async (req, res, next) => {
-    try {
-      await handleWayForPayCallback(req, res);
-    } catch (error) {
-      next(error);
-    }
-  },
-);
 
 app.use(
   cors({
@@ -140,6 +47,7 @@ app.use(
   }),
 );
 app.use(express.json({ limit: "1mb" }));
+app.use(express.urlencoded({ extended: false, limit: "1mb" }));
 
 app.get("/", (_req, res) => {
   res.json({
@@ -152,10 +60,9 @@ app.get("/", (_req, res) => {
       advisorAdvice: "/api/ai/advisor/advice",
       advisorTasks: "/api/ai/advisor/tasks",
       checkout: "/api/billing/checkout",
-      portal: "/api/billing/portal",
       adminUsers: "/api/admin/users",
       adminTrial: "/api/admin/users/trial",
-      wayforpayCallback: "/api/wayforpay/callback",
+      portmoneCallback: "/api/portmone/callback",
     },
   });
 });
@@ -170,14 +77,13 @@ app.get("/health", (_req, res) => {
 
 app.get("/api/me", requireAuth, async (req, res) => {
   const user = authUser(req);
-  const userId = user.uid;
   const [plan, usage] = await Promise.all([
-    getCurrentPlan(userId, user.email),
-    getMonthlyUsage(userId),
+    getCurrentPlan(user.uid, user.email),
+    getMonthlyUsage(user.uid),
   ]);
 
   res.json({
-    userId,
+    userId: user.uid,
     email: user.email ?? null,
     plan,
     usage,
@@ -234,20 +140,19 @@ app.post("/api/admin/users/trial", requireAuth, requireAdmin, async (req, res) =
       ? new Date(body.trialEndsAt)
       : new Date(now.getTime() + Number(body.trialDaysFromNow) * 24 * 60 * 60 * 1000);
 
-  const update: FirebaseFirestore.UpdateData<FirebaseFirestore.DocumentData> = {
-    planId: "free",
-    trialStartedAt: Timestamp.fromDate(now),
-    trialEndsAt: Timestamp.fromDate(trialEndsAt),
-    accessEndsAt: FieldValue.delete(),
-    currentPeriodEnd: FieldValue.delete(),
-    subscriptionStatus: "admin_test_override",
-    updatedAt: FieldValue.serverTimestamp(),
-  };
-  if (body.email) {
-    update.email = body.email.trim().toLowerCase();
-  }
-
-  await getUserDoc(userId).set(update, { merge: true });
+  await getUserDoc(userId).set(
+    {
+      planId: "free",
+      trialStartedAt: Timestamp.fromDate(now),
+      trialEndsAt: Timestamp.fromDate(trialEndsAt),
+      accessEndsAt: FieldValue.delete(),
+      currentPeriodEnd: FieldValue.delete(),
+      subscriptionStatus: "admin_test_override",
+      updatedAt: FieldValue.serverTimestamp(),
+      ...(body.email ? { email: body.email.trim().toLowerCase() } : {}),
+    },
+    { merge: true },
+  );
 
   const [plan, usage] = await Promise.all([getCurrentPlan(userId), getMonthlyUsage(userId)]);
   res.json({ userId, email: body.email ?? null, plan, usage });
@@ -322,12 +227,12 @@ app.post("/api/storage/check-capacity", requireAuth, async (req, res) => {
 
 app.post("/api/storage/sync", requireAuth, async (req, res) => {
   const user = authUser(req);
-  if (!bucketName) {
+  if (!FIREBASE_STORAGE_BUCKET) {
     throw httpError(500, "FIREBASE_STORAGE_BUCKET is not configured.");
   }
 
   const prefix = `task-manager-life-focus/${user.uid}/`;
-  const [files] = await admin.storage().bucket(bucketName).getFiles({ prefix });
+  const [files] = await admin.storage().bucket(FIREBASE_STORAGE_BUCKET).getFiles({ prefix });
   const storageBytes = files.reduce((sum, file) => sum + Number(file.metadata.size ?? 0), 0);
 
   await getUserDoc(user.uid).set(
@@ -350,65 +255,20 @@ app.post("/api/storage/sync", requireAuth, async (req, res) => {
 app.post("/api/billing/checkout", requireAuth, async (req, res) => {
   const user = authUser(req);
   const body = z.object({ plan: z.enum(["starter", "pro"]) }).parse(req.body);
-
-  if (BILLING_PROVIDER === "wayforpay") {
-    await ensureBillingUser(user.uid, user.email);
-    res.json({
-      provider: "wayforpay",
-      checkoutUrl: process.env.WAYFORPAY_SUBSCRIPTION_URL ?? "",
-    });
-    return;
-  }
-
-  ensureStripe();
-  const priceId =
-    body.plan === "starter"
-      ? process.env.STRIPE_PRICE_STARTER_MONTHLY
-      : process.env.STRIPE_PRICE_PRO_MONTHLY;
-
-  if (!priceId) {
-    throw httpError(500, `Stripe price id for ${body.plan} is not configured.`);
-  }
-
-  const customerId = await getOrCreateStripeCustomer(user);
-  const session = await stripe!.checkout.sessions.create({
-    mode: "subscription",
-    customer: customerId,
-    line_items: [{ price: priceId, quantity: 1 }],
-    success_url: `${appUrl}/app/billing?checkout=success`,
-    cancel_url: `${appUrl}/app/billing?checkout=cancelled`,
-    metadata: {
-      userId: user.uid,
-      plan: body.plan,
-    },
-    subscription_data: {
-      metadata: {
-        userId: user.uid,
-        plan: body.plan,
-      },
-    },
-  });
-
-  res.json({ url: session.url });
+  res.json(await createPortmoneCheckout(user, body.plan));
 });
 
-app.post("/api/billing/portal", requireAuth, async (req, res) => {
-  const user = authUser(req);
-  if (BILLING_PROVIDER === "wayforpay") {
-    res.status(501).json({
-      error: "WayForPay hosted subscriptions are managed on the WayForPay subscription page.",
-    });
-    return;
-  }
+app.get("/api/portmone/checkout/:orderReference", async (req, res) => {
+  await renderPortmoneCheckout(req, res);
+});
 
-  ensureStripe();
-  const customerId = await getOrCreateStripeCustomer(user);
-  const session = await stripe!.billingPortal.sessions.create({
-    customer: customerId,
-    return_url: `${appUrl}/app/billing`,
-  });
+app.post("/api/portmone/callback", async (req, res) => {
+  await handlePortmoneCallback(req, res);
+});
 
-  res.json({ url: session.url });
+app.post("/api/portmone/sync", requireAuth, requireAdmin, async (req, res) => {
+  const body = z.object({ orderReference: z.string().min(1) }).parse(req.body);
+  res.json({ order: await syncPortmoneOrder(body.orderReference) });
 });
 
 app.use((error: unknown, _req: Request, res: Response, _next: NextFunction) => {
@@ -423,605 +283,9 @@ app.use((error: unknown, _req: Request, res: Response, _next: NextFunction) => {
 });
 
 if (!process.env.VERCEL) {
-  app.listen(port, () => {
-    console.log(`Task Manager AI proxy listening on http://localhost:${port}`);
+  app.listen(PORT, () => {
+    console.log(`Task Manager AI proxy listening on http://localhost:${PORT}`);
   });
 }
 
 export default app;
-
-function initializeFirebase() {
-  if (admin.apps.length > 0) return;
-
-  const serviceAccountJson = process.env.FIREBASE_SERVICE_ACCOUNT_JSON;
-  if (serviceAccountJson) {
-    admin.initializeApp({
-      credential: admin.credential.cert(JSON.parse(serviceAccountJson)),
-      storageBucket: process.env.FIREBASE_STORAGE_BUCKET,
-    });
-    return;
-  }
-
-  admin.initializeApp({
-    credential: admin.credential.applicationDefault(),
-    storageBucket: process.env.FIREBASE_STORAGE_BUCKET,
-  });
-}
-
-async function requireAuth(req: Request, _res: Response, next: NextFunction) {
-  try {
-    const header = req.header("authorization");
-    const token = header?.startsWith("Bearer ") ? header.slice("Bearer ".length) : null;
-    if (!token) throw httpError(401, "Missing Firebase ID token.");
-
-    (req as AuthenticatedRequest).user = await admin.auth().verifyIdToken(token);
-    next();
-  } catch (error) {
-    next(error);
-  }
-}
-
-function authUser(req: Request) {
-  const user = (req as AuthenticatedRequest).user;
-  if (!user) throw httpError(401, "Missing authenticated user.");
-  return user;
-}
-
-async function requireAdmin(req: Request, _res: Response, next: NextFunction) {
-  try {
-    const user = authUser(req);
-    if (!isAdminEmail(user.email)) {
-      throw httpError(403, "Admin access is required.");
-    }
-    next();
-  } catch (error) {
-    next(error);
-  }
-}
-
-async function generateJson(
-  userId: string,
-  input: { contents: string; temperature: number; maxOutputTokens: number },
-) {
-  ensureGemini();
-  await reserveAiRequest(userId);
-
-  const response = await genai!.models.generateContent({
-    model: geminiModel,
-    contents: input.contents,
-    config: {
-      temperature: input.temperature,
-      maxOutputTokens: input.maxOutputTokens,
-      responseMimeType: "application/json",
-    },
-  });
-
-  const text = response.text?.trim();
-  if (!text) throw httpError(502, "Empty response from AI provider.");
-
-  await getMonthlyUsageDoc(userId).set(
-    {
-      outputTokens: FieldValue.increment(Number(response.usageMetadata?.candidatesTokenCount ?? 0)),
-      inputTokens: FieldValue.increment(Number(response.usageMetadata?.promptTokenCount ?? 0)),
-      totalTokens: FieldValue.increment(Number(response.usageMetadata?.totalTokenCount ?? 0)),
-      updatedAt: FieldValue.serverTimestamp(),
-    },
-    { merge: true },
-  );
-
-  try {
-    return { json: JSON.parse(text) };
-  } catch {
-    throw httpError(502, "AI provider returned invalid JSON.");
-  }
-}
-
-async function reserveAiRequest(userId: string) {
-  const usageRef = getMonthlyUsageDoc(userId);
-  const plan = await getCurrentPlan(userId);
-
-  if (plan.paymentRequired) {
-    throw httpError(402, "Free trial ended. Choose the $3 or $5 plan to continue using AI.");
-  }
-
-  await db.runTransaction(async (transaction) => {
-    const snapshot = await transaction.get(usageRef);
-    const aiRequests = Number(snapshot.data()?.aiRequests ?? 0);
-
-    if (!plan.adminAccess && aiRequests >= plan.aiRequestsPerMonth) {
-      throw httpError(402, "AI monthly limit reached. Upgrade the plan or wait for the next month.");
-    }
-
-    transaction.set(
-      usageRef,
-      {
-        userId,
-        month: currentMonthKey(),
-        aiRequests: FieldValue.increment(1),
-        updatedAt: FieldValue.serverTimestamp(),
-      },
-      { merge: true },
-    );
-  });
-}
-
-async function getCurrentPlan(
-  userId: string,
-  email?: string | null,
-): Promise<EffectiveUserPlan> {
-  const snapshot = await ensureBillingUser(userId, email ?? undefined);
-  return buildEffectivePlan(snapshot.data() ?? {});
-}
-
-function buildEffectivePlan(data: FirebaseFirestore.DocumentData): EffectiveUserPlan {
-  const adminAccess = isAdminEmail(data.email);
-  const planId = normalizePlan(data.planId) ?? "free";
-  const basePlan = adminAccess ? PLANS.pro : PLANS[planId] ?? PLANS.free;
-  const trialStartedAt = timestampToDate(data.trialStartedAt);
-  const trialEndsAt = timestampToDate(data.trialEndsAt);
-  const accessEndsAt = timestampToDate(data.accessEndsAt) ?? timestampToDate(data.currentPeriodEnd);
-  const isPaidPlan = planId === "starter" || planId === "pro";
-  const paidActive = Boolean(isPaidPlan && (!accessEndsAt || accessEndsAt.getTime() > Date.now()));
-  const trialActive = Boolean(trialEndsAt && trialEndsAt.getTime() > Date.now());
-
-  return {
-    ...basePlan,
-    trialDays: FREE_TRIAL_DAYS,
-    trialStartedAt: trialStartedAt ? trialStartedAt.toISOString() : null,
-    trialEndsAt: trialEndsAt ? trialEndsAt.toISOString() : null,
-    trialActive: adminAccess || paidActive || trialActive,
-    accessEndsAt: accessEndsAt ? accessEndsAt.toISOString() : null,
-    paymentRequired: !adminAccess && !paidActive && !trialActive,
-    adminAccess,
-  };
-}
-
-function toAdminBillingUser(
-  userId: string,
-  data: FirebaseFirestore.DocumentData,
-): AdminBillingUser {
-  const plan = buildEffectivePlan(data);
-  const status: AdminBillingUser["status"] = plan.adminAccess
-    ? "admin"
-    : plan.id !== "free" && !plan.paymentRequired
-      ? "paid-active"
-      : plan.trialActive
-        ? "trial-active"
-        : "expired";
-
-  return {
-    userId,
-    email: typeof data.email === "string" ? data.email : null,
-    plan,
-    status,
-    billingProvider:
-      typeof data.billingProvider === "string" ? data.billingProvider : null,
-    subscriptionStatus:
-      typeof data.subscriptionStatus === "string" ? data.subscriptionStatus : null,
-    wayforpayOrderReference:
-      typeof data.wayforpayOrderReference === "string"
-        ? data.wayforpayOrderReference
-        : null,
-    updatedAt: timestampToDate(data.updatedAt)?.toISOString() ?? null,
-    createdAt: timestampToDate(data.createdAt)?.toISOString() ?? null,
-  };
-}
-
-async function getMonthlyUsage(userId: string) {
-  const [usageSnapshot, userSnapshot] = await Promise.all([
-    getMonthlyUsageDoc(userId).get(),
-    getUserDoc(userId).get(),
-  ]);
-  const usage = usageSnapshot.data() ?? {};
-  const user = userSnapshot.data() ?? {};
-
-  return {
-    month: currentMonthKey(),
-    aiRequests: Number(usage.aiRequests ?? 0),
-    inputTokens: Number(usage.inputTokens ?? 0),
-    outputTokens: Number(usage.outputTokens ?? 0),
-    totalTokens: Number(usage.totalTokens ?? 0),
-    storageBytes: Number(user.storageBytes ?? 0),
-  };
-}
-
-async function getOrCreateStripeCustomer(user: admin.auth.DecodedIdToken) {
-  ensureStripe();
-  const ref = getUserDoc(user.uid);
-  const snapshot = await ensureBillingUser(user.uid, user.email);
-  const existing = snapshot.data()?.stripeCustomerId;
-  if (existing) return String(existing);
-
-  const customer = await stripe!.customers.create({
-    email: user.email,
-    metadata: { userId: user.uid },
-  });
-
-  await ref.set(
-    {
-      stripeCustomerId: customer.id,
-      email: user.email ?? null,
-      updatedAt: FieldValue.serverTimestamp(),
-      createdAt: snapshot.exists ? snapshot.data()?.createdAt ?? FieldValue.serverTimestamp() : FieldValue.serverTimestamp(),
-    },
-    { merge: true },
-  );
-
-  return customer.id;
-}
-
-async function ensureBillingUser(userId: string, email?: string) {
-  const ref = getUserDoc(userId);
-  const snapshot = await ref.get();
-  const now = new Date();
-  const data = snapshot.data();
-  const nextEmail = email ?? data?.email ?? null;
-  const adminAccess = isAdminEmail(nextEmail);
-  const trialStartedAt = timestampToDate(data?.trialStartedAt) ?? now;
-  const trialEndsAt =
-    timestampToDate(data?.trialEndsAt) ??
-    new Date(trialStartedAt.getTime() + FREE_TRIAL_DAYS * 24 * 60 * 60 * 1000);
-
-  if (!snapshot.exists || !data?.trialEndsAt) {
-    await ref.set(
-      {
-        planId: normalizePlan(data?.planId) ?? "free",
-        email: nextEmail,
-        adminAccess,
-        trialStartedAt: Timestamp.fromDate(trialStartedAt),
-        trialEndsAt: Timestamp.fromDate(trialEndsAt),
-        createdAt: data?.createdAt ?? FieldValue.serverTimestamp(),
-        updatedAt: FieldValue.serverTimestamp(),
-      },
-      { merge: true },
-    );
-
-    return ref.get();
-  }
-
-  if ((email && data.email !== email) || data.adminAccess !== adminAccess) {
-    await ref.set(
-      {
-        email: nextEmail,
-        adminAccess,
-        updatedAt: FieldValue.serverTimestamp(),
-      },
-      { merge: true },
-    );
-  }
-
-  return snapshot;
-}
-
-async function handleWayForPayCallback(req: Request, res: Response) {
-  ensureWayForPay();
-  const payload = z
-    .object({
-      merchantAccount: z.string(),
-      orderReference: z.string(),
-      merchantSignature: z.string(),
-      amount: z.union([z.string(), z.number()]),
-      currency: z.string(),
-      authCode: z.string().optional().default(""),
-      cardPan: z.string().optional().default(""),
-      transactionStatus: z.string(),
-      reasonCode: z.union([z.string(), z.number()]),
-      email: z.string().email().optional(),
-      clientEmail: z.string().email().optional(),
-      productName: z.union([z.string(), z.array(z.string())]).optional(),
-      createdDate: z.union([z.string(), z.number()]).optional(),
-      processingDate: z.union([z.string(), z.number()]).optional(),
-    })
-    .passthrough()
-    .parse(req.body);
-
-  if (wayforpayMerchantAccount && payload.merchantAccount !== wayforpayMerchantAccount) {
-    throw httpError(400, "Invalid WayForPay merchant account.");
-  }
-
-  const expectedSignature = signWayForPayServicePayload({
-    merchantAccount: payload.merchantAccount,
-    orderReference: payload.orderReference,
-    amount: payload.amount,
-    currency: payload.currency,
-    authCode: payload.authCode,
-    cardPan: payload.cardPan,
-    transactionStatus: payload.transactionStatus,
-    reasonCode: payload.reasonCode,
-  });
-
-  if (!safeEqual(payload.merchantSignature, expectedSignature)) {
-    throw httpError(400, "Invalid WayForPay callback signature.");
-  }
-
-  const paymentEmail = (payload.email ?? payload.clientEmail ?? "").trim().toLowerCase();
-  const plan = resolveWayForPayPlan(payload.amount, payload.productName);
-  const successful = payload.transactionStatus === "Approved" && String(payload.reasonCode) === "1100";
-  const time = Math.floor(Date.now() / 1000);
-
-  await db.collection("billingOrders").doc(payload.orderReference).set(
-    {
-      provider: "wayforpay",
-      status: payload.transactionStatus,
-      reasonCode: String(payload.reasonCode),
-      amount: Number(payload.amount),
-      currency: payload.currency,
-      email: paymentEmail || null,
-      plan,
-      payload,
-      updatedAt: FieldValue.serverTimestamp(),
-      createdAt: FieldValue.serverTimestamp(),
-    },
-    { merge: true },
-  );
-
-  if (successful && paymentEmail && (plan === "starter" || plan === "pro")) {
-    const userSnapshot = await findBillingUserByEmail(paymentEmail);
-
-    if (userSnapshot) {
-      const userId = userSnapshot.id;
-      const now = Date.now();
-      const currentPlan = await getCurrentPlan(userId);
-      const baseAccessEndsAt =
-        currentPlan.accessEndsAt && new Date(currentPlan.accessEndsAt).getTime() > now
-          ? new Date(currentPlan.accessEndsAt).getTime()
-          : now;
-      const accessEndsAt = new Date(baseAccessEndsAt + PAID_ACCESS_DAYS * 24 * 60 * 60 * 1000);
-
-      await setUserSubscription(userId, {
-        planId: plan,
-        stripeCustomerId: "",
-        stripeSubscriptionId: "",
-        subscriptionStatus: "active",
-        currentPeriodEnd: Timestamp.fromDate(accessEndsAt),
-        accessEndsAt: Timestamp.fromDate(accessEndsAt),
-        billingProvider: "wayforpay",
-        wayforpayOrderReference: payload.orderReference,
-      });
-    } else {
-      await db.collection("unmatchedBillingPayments").doc(payload.orderReference).set(
-        {
-          provider: "wayforpay",
-          email: paymentEmail,
-          plan,
-          amount: Number(payload.amount),
-          currency: payload.currency,
-          payload,
-          createdAt: FieldValue.serverTimestamp(),
-        },
-        { merge: true },
-      );
-    }
-  }
-
-  res.json({
-    orderReference: payload.orderReference,
-    status: "accept",
-    time,
-    signature: signWayForPayAccept(payload.orderReference, time),
-  });
-}
-
-async function handleStripeWebhook(req: Request, res: Response) {
-  ensureStripe();
-  const signature = req.header("stripe-signature");
-  const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET;
-
-  if (!signature || !webhookSecret) {
-    throw httpError(400, "Stripe webhook signature or secret is missing.");
-  }
-
-  const event = stripe!.webhooks.constructEvent(req.body, signature, webhookSecret);
-
-  switch (event.type) {
-    case "checkout.session.completed": {
-      const session = event.data.object;
-      const userId = session.metadata?.userId;
-      const plan = normalizePlan(session.metadata?.plan);
-      if (userId && plan) {
-        await setUserSubscription(userId, {
-          planId: plan,
-          stripeCustomerId: String(session.customer ?? ""),
-          stripeSubscriptionId: String(session.subscription ?? ""),
-          subscriptionStatus: "active",
-        });
-      }
-      break;
-    }
-    case "customer.subscription.updated":
-    case "customer.subscription.deleted": {
-      const subscription = event.data.object;
-      const userId = subscription.metadata?.userId;
-      const firstItem = subscription.items.data[0];
-      const plan = normalizePlan(subscription.metadata?.plan) ?? normalizePlanByPrice(firstItem?.price.id);
-      const active = event.type !== "customer.subscription.deleted" && ["active", "trialing"].includes(subscription.status);
-
-      if (userId) {
-        await setUserSubscription(userId, {
-          planId: active && plan ? plan : "free",
-          stripeCustomerId: String(subscription.customer),
-          stripeSubscriptionId: subscription.id,
-          subscriptionStatus: subscription.status,
-          currentPeriodEnd: firstItem?.current_period_end
-            ? Timestamp.fromMillis(firstItem.current_period_end * 1000)
-            : null,
-        });
-      }
-      break;
-    }
-  }
-
-  res.json({ received: true });
-}
-
-async function setUserSubscription(
-  userId: string,
-  data: {
-    planId: PlanId;
-    stripeCustomerId: string;
-    stripeSubscriptionId: string;
-    subscriptionStatus: string;
-    currentPeriodEnd?: Timestamp | null;
-    accessEndsAt?: Timestamp | null;
-    billingProvider?: string;
-    wayforpayOrderReference?: string;
-  },
-) {
-  await getUserDoc(userId).set(
-    {
-      ...data,
-      updatedAt: FieldValue.serverTimestamp(),
-    },
-    { merge: true },
-  );
-}
-
-function getUserDoc(userId: string) {
-  return db.collection("billingUsers").doc(userId);
-}
-
-function getMonthlyUsageDoc(userId: string) {
-  return getUserDoc(userId).collection("usage").doc(currentMonthKey());
-}
-
-function currentMonthKey(date = new Date()) {
-  return `${date.getUTCFullYear()}-${String(date.getUTCMonth() + 1).padStart(2, "0")}`;
-}
-
-function normalizePlan(value: unknown): PlanId | null {
-  return value === "free" || value === "starter" || value === "pro" ? value : null;
-}
-
-function normalizePlanByPrice(priceId: string | undefined): PlanId | null {
-  return priceId ? PLAN_BY_PRICE_ID.get(priceId) ?? null : null;
-}
-
-function resolveWayForPayPlan(
-  amountValue: string | number,
-  productName: string | string[] | undefined,
-): PlanId {
-  const names = Array.isArray(productName) ? productName : productName ? [productName] : [];
-  const normalizedName = names.join(" ").toLowerCase();
-  if (normalizedName.includes("pro")) return "pro";
-  if (normalizedName.includes("starter")) return "starter";
-
-  const amount = Number(amountValue);
-  const proAmount = Number(process.env.WAYFORPAY_PRO_AMOUNT ?? 200);
-  const starterAmount = Number(process.env.WAYFORPAY_STARTER_AMOUNT ?? 120);
-  if (amount >= proAmount) return "pro";
-  if (amount >= starterAmount) return "starter";
-  return "free";
-}
-
-async function findBillingUserByEmail(email: string) {
-  const snapshot = await db
-    .collection("billingUsers")
-    .where("email", "==", email)
-    .limit(1)
-    .get();
-  return snapshot.docs[0] ?? null;
-}
-
-async function getUserIdByEmail(email: string) {
-  try {
-    const user = await admin.auth().getUserByEmail(email.trim().toLowerCase());
-    return user.uid;
-  } catch {
-    throw httpError(404, `Firebase user was not found for email: ${email}`);
-  }
-}
-
-function timestampToDate(value: unknown): Date | null {
-  if (value instanceof Timestamp) return value.toDate();
-  if (value instanceof Date) return value;
-  if (typeof value === "string") {
-    const date = new Date(value);
-    return Number.isNaN(date.getTime()) ? null : date;
-  }
-  return null;
-}
-
-function ensureStripe() {
-  if (!stripe) throw httpError(500, "STRIPE_SECRET_KEY is not configured.");
-}
-
-function ensureWayForPay() {
-  if (!wayforpaySecretKey) {
-    throw httpError(500, "WAYFORPAY_SECRET_KEY is not configured.");
-  }
-}
-
-function ensureGemini() {
-  if (!genai) throw httpError(500, "GEMINI_API_KEY is not configured.");
-}
-
-function signWayForPayServicePayload(payload: {
-  merchantAccount: string;
-  orderReference: string;
-  amount: string | number;
-  currency: string;
-  authCode: string;
-  cardPan: string;
-  transactionStatus: string;
-  reasonCode: string | number;
-}) {
-  return signWayForPay(
-    [
-      payload.merchantAccount,
-      payload.orderReference,
-      payload.amount,
-      payload.currency,
-      payload.authCode,
-      payload.cardPan,
-      payload.transactionStatus,
-      payload.reasonCode,
-    ].join(";"),
-  );
-}
-
-function signWayForPayAccept(orderReference: string, time: number) {
-  return signWayForPay([orderReference, "accept", time].join(";"));
-}
-
-function signWayForPay(baseString: string) {
-  return createHmac("md5", wayforpaySecretKey!).update(baseString, "utf8").digest("hex");
-}
-
-function safeEqual(left: string, right: string) {
-  const leftBuffer = Buffer.from(left);
-  const rightBuffer = Buffer.from(right);
-  return leftBuffer.length === rightBuffer.length && timingSafeEqual(leftBuffer, rightBuffer);
-}
-
-function parseCsv(value: string | undefined) {
-  return (value ?? "")
-    .split(",")
-    .map((item) => item.trim())
-    .filter(Boolean);
-}
-
-function isAdminEmail(email: unknown) {
-  return typeof email === "string" && ADMIN_EMAILS.has(email.trim().toLowerCase());
-}
-
-function httpError(status: number, message: string) {
-  const error = new Error(message) as Error & { status: number };
-  error.status = status;
-  return error;
-}
-
-const CATEGORY_LIST =
-  "health, career, learning, finance, relationships, home, leisure, other";
-const PRIORITY_LIST = "low, medium, high";
-
-const PARSE_TASKS_SYSTEM = `You are a task extraction assistant. Extract tasks from the user's natural language input.
-Return a JSON object with a "tasks" array. Each task has:
-- title: string
-- priority: one of ${PRIORITY_LIST}
-- time: number duration in minutes, 0 if not specified
-- category: one of ${CATEGORY_LIST} or null
-Handle Ukrainian and English. Return ONLY valid JSON, no markdown.`;
-
-const ADVISOR_ADVICE_ONLY_SYSTEM = `Ти - помічник з планування часу та продуктивності. Відповідай українською, коротко та зрозуміло. Поверни JSON лише з полем "advice" - текст поради без markdown.`;
-
-const ADVISOR_TASKS_ONLY_SYSTEM = `Ти формуєш список задач на основі поради. Поверни JSON лише з полем "tasks" - масив задач. Кожна задача: title, priority ("low"|"medium"|"high"), time (тривалість у хвилинах), category з [${CATEGORY_LIST}] або null, whenDo - масив 1-7 опційно.`;
