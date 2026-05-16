@@ -266,6 +266,10 @@ app.post("/api/portmone/callback", async (req, res) => {
   await handlePortmoneCallback(req, res);
 });
 
+app.get("/api/portmone/callback", async (req, res) => {
+  await handlePortmoneCallback(req, res);
+});
+
 app.post("/api/portmone/sync", requireAuth, requireAdmin, async (req, res) => {
   const body = z.object({ orderReference: z.string().min(1) }).parse(req.body);
   res.json({ order: await syncPortmoneOrder(body.orderReference) });

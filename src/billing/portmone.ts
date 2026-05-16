@@ -92,7 +92,8 @@ export async function renderPortmoneCheckout(req: Request, res: Response) {
 
 export async function handlePortmoneCallback(req: Request, res: Response) {
   ensurePortmoneStatusConfig();
-  const payload = z.record(z.string(), z.unknown()).parse(req.body);
+  const payloadSource = req.method === "GET" ? req.query : req.body;
+  const payload = z.record(z.string(), z.unknown()).parse(payloadSource ?? {});
   const orderReference = readString(payload, "shopOrderNumber", "SHOPORDERNUMBER", "BILL_NUMBER");
 
   if (!orderReference) {
@@ -104,7 +105,7 @@ export async function handlePortmoneCallback(req: Request, res: Response) {
 
   const order = orderSnapshot.data() as PortmoneOrder;
   const reportRow = await fetchPortmoneOrderStatus(orderReference);
-  const paid = reportRow.status === "PAYED";
+  const paid = normalizePortmoneStatus(reportRow.status) === "PAYED";
   const reportedAmount = Number(reportRow.billAmount ?? order.amount);
 
   if (paid && Math.abs(reportedAmount - order.amount) > 0.01) {
@@ -123,7 +124,7 @@ export async function handlePortmoneCallback(req: Request, res: Response) {
   );
 
   if (paid) {
-    await activatePaidAccess(orderReference, order);
+    await activatePaidAccessOnce(orderReference, order);
   }
 
   sendPortmoneCallbackResponse(req, res, orderReference);
@@ -147,8 +148,8 @@ export async function syncPortmoneOrder(orderReference: string) {
     { merge: true },
   );
 
-  if (reportRow.status === "PAYED") {
-    await activatePaidAccess(orderReference, order);
+  if (normalizePortmoneStatus(reportRow.status) === "PAYED") {
+    await activatePaidAccessOnce(orderReference, order);
   }
 
   return reportRow;
@@ -175,7 +176,7 @@ function buildPortmonePaymentRequest(orderReference: string, order: PortmoneOrde
       billAmount,
       billCurrency: order.currency,
       successUrl: `${PROXY_URL}/api/portmone/callback`,
-      failureUrl: `${APP_URL}/app/billing?checkout=cancelled`,
+      failureUrl: `${APP_URL}/payment-result?status=failed&orderReference=${encodeURIComponent(orderReference)}`,
       preauthFlag: "N",
     },
     payer: {
@@ -203,6 +204,21 @@ async function activatePaidAccess(orderReference: string, order: PortmoneOrder) 
     billingProvider: "portmone",
     portmoneOrderReference: orderReference,
   });
+}
+
+async function activatePaidAccessOnce(orderReference: string, order: PortmoneOrder) {
+  const orderRef = db.collection("billingOrders").doc(orderReference);
+  const orderSnapshot = await orderRef.get();
+  if (orderSnapshot.data()?.paidAccessActivatedAt) return;
+
+  await activatePaidAccess(orderReference, order);
+  await orderRef.set(
+    {
+      paidAccessActivatedAt: FieldValue.serverTimestamp(),
+      updatedAt: FieldValue.serverTimestamp(),
+    },
+    { merge: true },
+  );
 }
 
 async function fetchPortmoneOrderStatus(orderReference: string): Promise<PortmoneReportRow> {
@@ -272,7 +288,10 @@ function sendPortmoneCallbackResponse(req: Request, res: Response, orderReferenc
     return;
   }
 
-  res.redirect(303, `${APP_URL}/app/billing?checkout=success`);
+  res.redirect(
+    303,
+    `${APP_URL}/payment-result?status=success&orderReference=${encodeURIComponent(orderReference)}`,
+  );
 }
 
 function getPortmonePlanAmount(plan: Extract<PlanId, "starter" | "pro">) {
@@ -302,8 +321,16 @@ function readString(payload: Record<string, unknown>, ...keys: string[]) {
   for (const key of keys) {
     const value = payload[key];
     if (typeof value === "string" && value.trim()) return value.trim();
+    if (Array.isArray(value)) {
+      const first = value.find((item) => typeof item === "string" && item.trim());
+      if (typeof first === "string") return first.trim();
+    }
   }
   return null;
+}
+
+function normalizePortmoneStatus(status: unknown) {
+  return typeof status === "string" ? status.trim().toUpperCase() : "";
 }
 
 function firstRouteParam(value: string | string[] | undefined) {
