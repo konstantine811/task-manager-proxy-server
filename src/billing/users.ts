@@ -25,7 +25,7 @@ export async function getCurrentPlan(
 }
 
 export function buildEffectivePlan(data: FirebaseFirestore.DocumentData): EffectiveUserPlan {
-  const adminAccess = isAdminEmail(data.email);
+  const adminAccess = data.adminAccess === true || isAdminEmail(data.email);
   const planId = normalizePlan(data.planId) ?? "free";
   const basePlan = adminAccess ? PLANS.pro : PLANS[planId] ?? PLANS.free;
   const trialStartedAt = timestampToDate(data.trialStartedAt);

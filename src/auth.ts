@@ -1,5 +1,6 @@
 import type { NextFunction, Request, Response } from "express";
 import { admin } from "./firebase.js";
+import { db } from "./firebase.js";
 import { httpError } from "./errors.js";
 import { isAdminEmail } from "./config.js";
 import type { AuthenticatedRequest } from "./types.js";
@@ -26,9 +27,16 @@ export function authUser(req: Request) {
 export async function requireAdmin(req: Request, _res: Response, next: NextFunction) {
   try {
     const user = authUser(req);
-    if (!isAdminEmail(user.email)) {
+    if (isAdminEmail(user.email)) {
+      next();
+      return;
+    }
+
+    const billingUser = await db.collection("billingUsers").doc(user.uid).get();
+    if (billingUser.data()?.adminAccess !== true) {
       throw httpError(403, "Admin access is required.");
     }
+
     next();
   } catch (error) {
     next(error);
