@@ -49,8 +49,6 @@ const PORTMONE_CURRENCY = process.env.PORTMONE_CURRENCY ?? "UAH";
 const PORTMONE_LANGUAGE = process.env.PORTMONE_LANGUAGE ?? "uk";
 const PORTMONE_CHECKOUT_SCRIPT =
   'document.getElementById("portmone-checkout").submit();';
-const PORTMONE_CHECKOUT_SCRIPT_HASH =
-  "'sha256-khLvC+xq6D9QSizb0mJxqSurlJPFHGpZLivkg0yI5Jk='";
 
 export async function createPortmoneCheckout(
   user: { uid: string; email?: string },
@@ -100,7 +98,7 @@ export async function renderPortmoneCheckout(req: Request, res: Response) {
   res
     .setHeader(
       "Content-Security-Policy",
-      `default-src 'none'; base-uri 'none'; form-action ${PORTMONE_GATEWAY_URL}; script-src ${PORTMONE_CHECKOUT_SCRIPT_HASH}; style-src 'unsafe-inline';`,
+      `default-src 'none'; base-uri 'none'; form-action ${PORTMONE_GATEWAY_URL}; script-src 'unsafe-inline'; style-src 'unsafe-inline';`,
     )
     .status(200)
     .type("html")
