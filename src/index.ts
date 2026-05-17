@@ -25,6 +25,7 @@ import {
   createPortmoneCheckout,
   handlePortmoneCallback,
   renderPortmoneCheckout,
+  refundPortmoneOrder,
   syncPortmoneOrder,
 } from "./billing/portmone.js";
 
@@ -62,6 +63,7 @@ app.get("/", (_req, res) => {
       checkout: "/api/billing/checkout",
       adminUsers: "/api/admin/users",
       adminTrial: "/api/admin/users/trial",
+      adminPortmoneRefund: "/api/admin/portmone/refund",
       portmoneCallback: "/api/portmone/callback",
     },
   });
@@ -273,6 +275,17 @@ app.get("/api/portmone/callback", async (req, res) => {
 app.post("/api/portmone/sync", requireAuth, requireAdmin, async (req, res) => {
   const body = z.object({ orderReference: z.string().min(1) }).parse(req.body);
   res.json({ order: await syncPortmoneOrder(body.orderReference) });
+});
+
+app.post("/api/admin/portmone/refund", requireAuth, requireAdmin, async (req, res) => {
+  const body = z
+    .object({
+      orderReference: z.string().min(1),
+      amount: z.number().finite().positive().optional(),
+      message: z.string().max(500).optional(),
+    })
+    .parse(req.body);
+  res.json(await refundPortmoneOrder(body.orderReference, body));
 });
 
 app.use((error: unknown, _req: Request, res: Response, _next: NextFunction) => {

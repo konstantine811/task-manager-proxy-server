@@ -36,7 +36,6 @@ vercel env add FIREBASE_STORAGE_BUCKET production
 vercel env add PORTMONE_PAYEE_ID production
 vercel env add PORTMONE_LOGIN production
 vercel env add PORTMONE_PASSWORD production
-vercel env add PORTMONE_SIGNATURE_KEY production
 vercel env add PORTMONE_STARTER_AMOUNT production
 vercel env add PORTMONE_PRO_AMOUNT production
 vercel env add APP_URL production
@@ -53,7 +52,6 @@ Required environment variables:
 - `PORTMONE_PAYEE_ID`
 - `PORTMONE_LOGIN`
 - `PORTMONE_PASSWORD`
-- `PORTMONE_SIGNATURE_KEY`
 - `PORTMONE_STARTER_AMOUNT`
 - `PORTMONE_PRO_AMOUNT`
 - `FIREBASE_STORAGE_BUCKET`
@@ -67,6 +65,7 @@ Required environment variables:
 Optional Portmone variables:
 
 - `PORTMONE_GATEWAY_URL` defaults to `https://www.portmone.com.ua/gateway/`
+- `PORTMONE_SIGNATURE_KEY` enables signed JSON checkout; if omitted, the proxy uses standard Portmone POST fields
 - `PORTMONE_CURRENCY` defaults to `UAH`
 - `PORTMONE_LANGUAGE` defaults to `uk`
 
@@ -102,6 +101,7 @@ const response = await fetch(`${import.meta.env.VITE_AI_PROXY_URL}/api/ai/parse-
 - `GET /api/portmone/checkout/:orderReference`
 - `POST /api/portmone/callback`
 - `POST /api/portmone/sync`
+- `POST /api/admin/portmone/refund`
 
 ## Portmone
 
@@ -121,7 +121,7 @@ It creates a `billingOrders/{orderReference}` record and returns:
 }
 ```
 
-Open `checkoutUrl` in the browser. The proxy renders a small auto-submit form because Portmone's payment gateway expects a browser POST with `bodyRequest` and `typeRequest=json`.
+Open `checkoutUrl` in the browser. The proxy renders a small auto-submit form because Portmone's payment gateway expects a browser POST. If `PORTMONE_SIGNATURE_KEY` is configured, the proxy sends a signed JSON `bodyRequest`; otherwise it sends standard Portmone POST fields.
 
 Set the Portmone success URL to:
 
@@ -137,6 +137,22 @@ subscriptionStatus=active
 portmoneOrderReference={orderReference}
 accessEndsAt={now + PAID_ACCESS_DAYS}
 ```
+
+Admin refund endpoint:
+
+```http
+POST /api/admin/portmone/refund
+Authorization: Bearer <Firebase ID token>
+Content-Type: application/json
+
+{
+  "orderReference": "lf-starter-...",
+  "amount": 120,
+  "message": "Customer refund"
+}
+```
+
+`amount` is optional. When omitted, the proxy requests a full refund and marks the user's subscription as `refunded`.
 
 Recommended UAH pricing:
 

@@ -29,6 +29,16 @@ type PortmoneReportRow = {
   errorMessage?: string;
 };
 
+type PortmoneRefundResult = {
+  status?: string;
+  shopBillId?: string;
+  shopOrderNumber?: string;
+  billAmount?: string | number;
+  errorCode?: string | number;
+  errorMessage?: string;
+  [key: string]: unknown;
+};
+
 const PORTMONE_GATEWAY_URL =
   process.env.PORTMONE_GATEWAY_URL ?? "https://www.portmone.com.ua/gateway/";
 const PORTMONE_PAYEE_ID = process.env.PORTMONE_PAYEE_ID;
@@ -55,8 +65,8 @@ export async function createPortmoneCheckout(
     currency: PORTMONE_CURRENCY,
   };
 
-  // The local checkout page submits a signed form to Portmone because the
-  // gateway expects a browser POST, not a plain redirect URL.
+  // The local checkout page submits a form to Portmone because the gateway
+  // expects a browser POST, not a plain redirect URL.
   await db.collection("billingOrders").doc(orderReference).set({
     provider: "portmone",
     status: "created",
@@ -81,13 +91,12 @@ export async function renderPortmoneCheckout(req: Request, res: Response) {
   if (!snapshot.exists) throw httpError(404, "Portmone order was not found.");
 
   const order = snapshot.data() as PortmoneOrder;
-  const paymentRequest = buildPortmonePaymentRequest(orderReference, order);
-  const bodyRequest = JSON.stringify(paymentRequest);
+  const formFields = buildPortmoneFormFields(orderReference, order);
 
   res
     .status(200)
     .type("html")
-    .send(renderAutoSubmitForm(PORTMONE_GATEWAY_URL, bodyRequest));
+    .send(renderAutoSubmitFormFields(PORTMONE_GATEWAY_URL, formFields));
 }
 
 export async function handlePortmoneCallback(req: Request, res: Response) {
@@ -153,6 +162,105 @@ export async function syncPortmoneOrder(orderReference: string) {
   }
 
   return reportRow;
+}
+
+export async function refundPortmoneOrder(
+  orderReference: string,
+  options: {
+    amount?: number;
+    message?: string;
+  } = {},
+) {
+  ensurePortmoneStatusConfig();
+
+  let orderSnapshot = await db.collection("billingOrders").doc(orderReference).get();
+  if (!orderSnapshot.exists) throw httpError(404, "Portmone order was not found.");
+
+  let orderData = orderSnapshot.data() as PortmoneOrder & {
+    portmoneShopBillId?: string | null;
+    status?: string;
+  };
+
+  if (!orderData.portmoneShopBillId) {
+    await syncPortmoneOrder(orderReference);
+    orderSnapshot = await db.collection("billingOrders").doc(orderReference).get();
+    orderData = orderSnapshot.data() as PortmoneOrder & {
+      portmoneShopBillId?: string | null;
+      status?: string;
+    };
+  }
+
+  if (!orderData.portmoneShopBillId) {
+    throw httpError(409, "Portmone shopBillId is required before refund.");
+  }
+
+  const refundAmount =
+    Number.isFinite(options.amount) && Number(options.amount) > 0
+      ? Number(options.amount)
+      : orderData.amount;
+  const result = await requestPortmoneRefund({
+    shopBillId: orderData.portmoneShopBillId,
+    amount: refundAmount,
+    message: options.message?.trim() || `Refund ${orderReference}`,
+  });
+
+  const isFullRefund = Math.abs(refundAmount - orderData.amount) <= 0.01;
+  await db.collection("billingOrders").doc(orderReference).set(
+    {
+      status: "refund_requested",
+      refundAmount,
+      refundPayload: result,
+      refundedAt: FieldValue.serverTimestamp(),
+      updatedAt: FieldValue.serverTimestamp(),
+    },
+    { merge: true },
+  );
+
+  if (isFullRefund) {
+    await setUserSubscription(orderData.userId, {
+      planId: "free",
+      subscriptionStatus: "refunded",
+      currentPeriodEnd: Timestamp.fromDate(new Date()),
+      accessEndsAt: Timestamp.fromDate(new Date()),
+      billingProvider: "portmone",
+      portmoneOrderReference: orderReference,
+    });
+  }
+
+  return {
+    orderReference,
+    refundAmount,
+    fullRefund: isFullRefund,
+    result,
+  };
+}
+
+function buildPortmoneFormFields(orderReference: string, order: PortmoneOrder) {
+  if (PORTMONE_SIGNATURE_KEY && PORTMONE_LOGIN) {
+    return {
+      bodyRequest: JSON.stringify(buildPortmonePaymentRequest(orderReference, order)),
+      typeRequest: "json",
+    };
+  }
+
+  return buildPortmonePlainPostFields(orderReference, order);
+}
+
+function buildPortmonePlainPostFields(orderReference: string, order: PortmoneOrder) {
+  return {
+    payee_id: String(PORTMONE_PAYEE_ID),
+    shop_order_number: orderReference,
+    bill_amount: formatAmount(order.amount),
+    bill_currency: order.currency,
+    description: `Life Focus ${order.plan} plan`,
+    success_url: `${PROXY_URL}/api/portmone/callback`,
+    failure_url: `${APP_URL}/payment-result?status=failed&orderReference=${encodeURIComponent(orderReference)}`,
+    lang: PORTMONE_LANGUAGE,
+    encoding: "UTF-8",
+    attribute1: order.userId,
+    attribute2: order.plan,
+    attribute3: order.email ?? "",
+  };
 }
 
 function buildPortmonePaymentRequest(orderReference: string, order: PortmoneOrder) {
@@ -250,6 +358,47 @@ async function fetchPortmoneOrderStatus(orderReference: string): Promise<Portmon
   return row;
 }
 
+async function requestPortmoneRefund({
+  shopBillId,
+  amount,
+  message,
+}: {
+  shopBillId: string;
+  amount: number;
+  message: string;
+}): Promise<PortmoneRefundResult> {
+  const response = await fetch(PORTMONE_GATEWAY_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      method: "reject",
+      params: {
+        data: {
+          login: PORTMONE_LOGIN,
+          password: PORTMONE_PASSWORD,
+          payeeId: PORTMONE_PAYEE_ID,
+          shopbillId: shopBillId,
+          returnAmount: formatAmount(amount),
+          message,
+        },
+      },
+      id: `refund-${shopBillId}-${Date.now()}`,
+    }),
+  });
+
+  if (!response.ok) {
+    throw httpError(502, `Portmone refund request failed with ${response.status}.`);
+  }
+
+  const data = (await response.json()) as unknown;
+  const row = extractRefundRow(data);
+  if (!row) throw httpError(502, "Portmone returned an unexpected refund response.");
+  if (row.errorCode && String(row.errorCode) !== "0") {
+    throw httpError(502, row.errorMessage || "Portmone refund request failed.");
+  }
+  return row;
+}
+
 function extractReportRow(data: unknown, orderReference: string): PortmoneReportRow | null {
   if (!Array.isArray(data)) return null;
   return (
@@ -261,6 +410,19 @@ function extractReportRow(data: unknown, orderReference: string): PortmoneReport
   );
 }
 
+function extractRefundRow(data: unknown): PortmoneRefundResult | null {
+  if (Array.isArray(data)) {
+    const first = data[0];
+    return first && typeof first === "object" ? (first as PortmoneRefundResult) : null;
+  }
+
+  if (data && typeof data === "object") {
+    return data as PortmoneRefundResult;
+  }
+
+  return null;
+}
+
 function signPortmoneCheckout(orderReference: string, billAmount: string, dt: string) {
   const base =
     `${PORTMONE_PAYEE_ID}${dt}${toHex(orderReference)}${billAmount}`.toUpperCase() +
@@ -269,13 +431,26 @@ function signPortmoneCheckout(orderReference: string, billAmount: string, dt: st
 }
 
 function renderAutoSubmitForm(action: string, bodyRequest: string) {
+  return renderAutoSubmitFormFields(action, {
+    bodyRequest,
+    typeRequest: "json",
+  });
+}
+
+function renderAutoSubmitFormFields(action: string, fields: Record<string, string>) {
+  const inputs = Object.entries(fields)
+    .map(
+      ([name, value]) =>
+        `<input type="hidden" name="${escapeHtml(name)}" value="${escapeHtml(value)}">`,
+    )
+    .join("\n      ");
+
   return `<!doctype html>
 <html lang="uk">
   <head><meta charset="utf-8"><title>Redirecting to Portmone</title></head>
   <body>
     <form id="portmone-checkout" action="${escapeHtml(action)}" method="post">
-      <input type="hidden" name="bodyRequest" value="${escapeHtml(bodyRequest)}">
-      <input type="hidden" name="typeRequest" value="json">
+      ${inputs}
     </form>
     <script>document.getElementById("portmone-checkout").submit();</script>
   </body>
@@ -305,8 +480,8 @@ function getPortmonePlanAmount(plan: Extract<PlanId, "starter" | "pro">) {
 }
 
 function ensurePortmoneCheckoutConfig() {
-  if (!PORTMONE_PAYEE_ID || !PORTMONE_LOGIN || !PORTMONE_SIGNATURE_KEY) {
-    throw httpError(500, "PORTMONE_PAYEE_ID, PORTMONE_LOGIN and PORTMONE_SIGNATURE_KEY are required.");
+  if (!PORTMONE_PAYEE_ID) {
+    throw httpError(500, "PORTMONE_PAYEE_ID is required.");
   }
 }
 
