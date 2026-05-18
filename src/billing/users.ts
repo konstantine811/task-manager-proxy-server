@@ -34,15 +34,16 @@ export function buildEffectivePlan(data: FirebaseFirestore.DocumentData): Effect
   const isPaidPlan = planId === "starter" || planId === "pro";
   const paidActive = Boolean(isPaidPlan && (!accessEndsAt || accessEndsAt.getTime() > Date.now()));
   const trialActive = Boolean(trialEndsAt && trialEndsAt.getTime() > Date.now());
+  const activePlan = adminAccess || paidActive ? basePlan : PLANS.free;
 
   return {
-    ...basePlan,
+    ...activePlan,
     trialDays: FREE_TRIAL_DAYS,
     trialStartedAt: trialStartedAt ? trialStartedAt.toISOString() : null,
     trialEndsAt: trialEndsAt ? trialEndsAt.toISOString() : null,
     trialActive: adminAccess || paidActive || trialActive,
     accessEndsAt: accessEndsAt ? accessEndsAt.toISOString() : null,
-    paymentRequired: !adminAccess && !paidActive && !trialActive,
+    paymentRequired: false,
     adminAccess,
   };
 }
@@ -153,6 +154,28 @@ export async function setUserSubscription(
     {
       ...data,
       updatedAt: FieldValue.serverTimestamp(),
+    },
+    { merge: true },
+  );
+}
+
+export async function setManualUserAccess(
+  userId: string,
+  data: {
+    planId: Exclude<PlanId, "free">;
+    accessEndsAt: Timestamp;
+    email?: string | null;
+  },
+) {
+  await getUserDoc(userId).set(
+    {
+      planId: data.planId,
+      accessEndsAt: data.accessEndsAt,
+      currentPeriodEnd: data.accessEndsAt,
+      billingProvider: "manual",
+      subscriptionStatus: "manual_active",
+      updatedAt: FieldValue.serverTimestamp(),
+      ...(data.email ? { email: data.email.trim().toLowerCase() } : {}),
     },
     { merge: true },
   );

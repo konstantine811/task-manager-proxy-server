@@ -19,10 +19,10 @@ import {
   getMonthlyUsage,
   getUserDoc,
   getUserIdByEmail,
+  setManualUserAccess,
   toAdminBillingUser,
 } from "./billing/users.js";
 import {
-  createPortmoneCheckout,
   handlePortmoneCallback,
   renderPortmoneCheckout,
   refundPortmoneOrder,
@@ -60,11 +60,9 @@ app.get("/", (_req, res) => {
       parseTasks: "/api/ai/parse-tasks",
       advisorAdvice: "/api/ai/advisor/advice",
       advisorTasks: "/api/ai/advisor/tasks",
-      checkout: "/api/billing/checkout",
       adminUsers: "/api/admin/users",
+      adminAccess: "/api/admin/users/access",
       adminTrial: "/api/admin/users/trial",
-      adminPortmoneRefund: "/api/admin/portmone/refund",
-      portmoneCallback: "/api/portmone/callback",
     },
   });
 });
@@ -160,6 +158,46 @@ app.post("/api/admin/users/trial", requireAuth, requireAdmin, async (req, res) =
   res.json({ userId, email: body.email ?? null, plan, usage });
 });
 
+app.post("/api/admin/users/access", requireAuth, requireAdmin, async (req, res) => {
+  const body = z
+    .object({
+      email: z.string().email().optional(),
+      userId: z.string().min(1).optional(),
+      plan: z.enum(["starter", "pro"]),
+      accessEndsAt: z.string().datetime().optional(),
+      accessDaysFromNow: z.number().finite().positive().optional(),
+    })
+    .refine((value) => value.email || value.userId, {
+      message: "Provide either email or userId.",
+      path: ["email"],
+    })
+    .refine(
+      (value) =>
+        [value.accessEndsAt, value.accessDaysFromNow].filter((item) => item !== undefined)
+          .length === 1,
+      {
+        message: "Provide exactly one of accessEndsAt or accessDaysFromNow.",
+        path: ["accessEndsAt"],
+      },
+    )
+    .parse(req.body);
+
+  const userId = body.userId ?? (await getUserIdByEmail(body.email!));
+  const now = new Date();
+  const accessEndsAt = body.accessEndsAt
+    ? new Date(body.accessEndsAt)
+    : new Date(now.getTime() + Number(body.accessDaysFromNow) * 24 * 60 * 60 * 1000);
+
+  await setManualUserAccess(userId, {
+    planId: body.plan,
+    accessEndsAt: Timestamp.fromDate(accessEndsAt),
+    email: body.email,
+  });
+
+  const [plan, usage] = await Promise.all([getCurrentPlan(userId), getMonthlyUsage(userId)]);
+  res.json({ userId, email: body.email ?? null, plan, usage });
+});
+
 app.post("/api/ai/parse-tasks", requireAuth, async (req, res) => {
   const user = authUser(req);
   const body = z.object({ text: z.string().min(1).max(8000) }).parse(req.body);
@@ -220,7 +258,7 @@ app.post("/api/storage/check-capacity", requireAuth, async (req, res) => {
   const projectedBytes = usage.storageBytes + body.additionalBytes;
 
   res.json({
-    allowed: plan.adminAccess || (!plan.paymentRequired && projectedBytes <= plan.storageBytes),
+    allowed: plan.adminAccess || projectedBytes <= plan.storageBytes,
     plan,
     storageBytes: usage.storageBytes,
     projectedBytes,
@@ -250,14 +288,14 @@ app.post("/api/storage/sync", requireAuth, async (req, res) => {
   res.json({
     storageBytes,
     plan,
-    allowed: plan.adminAccess || (!plan.paymentRequired && storageBytes <= plan.storageBytes),
+    allowed: plan.adminAccess || storageBytes <= plan.storageBytes,
   });
 });
 
 app.post("/api/billing/checkout", requireAuth, async (req, res) => {
-  const user = authUser(req);
-  const body = z.object({ plan: z.enum(["starter", "pro"]) }).parse(req.body);
-  res.json(await createPortmoneCheckout(user, body.plan));
+  res.status(410).json({
+    error: "Automatic checkout is disabled. Use manual support payments.",
+  });
 });
 
 app.get("/api/portmone/checkout/:orderReference", async (req, res) => {

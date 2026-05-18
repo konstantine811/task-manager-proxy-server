@@ -50,10 +50,6 @@ async function reserveAiRequest(userId: string) {
   const usageRef = getMonthlyUsageDoc(userId);
   const plan = await getCurrentPlan(userId);
 
-  if (plan.paymentRequired) {
-    throw httpError(402, "Free trial ended. Choose the $3 or $5 plan to continue using AI.");
-  }
-
   await db.runTransaction(async (transaction) => {
     const snapshot = await transaction.get(usageRef);
     const aiRequests = Number(snapshot.data()?.aiRequests ?? 0);
